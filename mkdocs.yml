@@ -224,6 +224,7 @@ nav:
         - tutorials/models/Qwen3-ASR-1.7B.md
         - tutorials/models/Qwen2.5-Math-RM-72B.md
         - tutorials/models/InternVL3.5.md
+        - tutorials/models/Dots3-Note.md
     - Feature Tutorials:
         - tutorials/features/index.md
         - tutorials/features/pd_colocated_mooncake_multi_instance.md
@@ -270,6 +271,7 @@ nav:
         - user_guide/feature_guide/sequence_parallelism.md
         - user_guide/feature_guide/batch_invariance.md
         - user_guide/feature_guide/lmcache_ascend_deployment.md
+        - user_guide/feature_guide/pipeline_parallel.md
         - user_guide/feature_guide/dynamic_chunk_pipeline_parallel.md
         - user_guide/feature_guide/flash_attention.md
         - user_guide/feature_guide/short_request_first.md
