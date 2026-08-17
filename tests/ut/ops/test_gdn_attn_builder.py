@@ -575,6 +575,11 @@ def test_full_graph_spec_actual_seq_lengths_use_padded_builder_buffer():
         attn_metadata.num_accepted_tokens,
         torch.tensor([2, 4, 1, 1], dtype=torch.int32),
     )
+    execution_plan = attn_metadata.execution_plan
+    assert execution_plan.has_spec_decode
+    assert execution_plan.is_uniform_spec_decode
+    assert not execution_plan.has_non_spec
+    assert execution_plan.spec_token_indices.data_ptr() == attn_metadata.spec_token_indx.data_ptr()
 
 
 def test_full_graph_non_spec_actual_seq_lengths_use_padded_builder_buffer():
@@ -615,6 +620,11 @@ def test_full_graph_non_spec_actual_seq_lengths_use_padded_builder_buffer():
         attn_metadata.non_spec_state_indices_tensor,
         torch.tensor([0, 1, NULL_BLOCK_ID, NULL_BLOCK_ID], dtype=torch.int32),
     )
+    execution_plan = attn_metadata.execution_plan
+    assert execution_plan.has_decode
+    assert not execution_plan.has_prefill
+    assert not execution_plan.has_spec_decode
+    assert execution_plan.num_actual_tokens == 2
 
 
 def test_causal_conv1d_cache_indices_use_device_block_table(monkeypatch: pytest.MonkeyPatch):

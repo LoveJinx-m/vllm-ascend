@@ -32,6 +32,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_ascend.ops.gdn_execution import attach_gdn_execution_plan
 from vllm_ascend.ops.triton.fla.utils import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
@@ -849,7 +850,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             and graph_request_count <= self.decode_cudagraph_max_bs
         ):
             self._pad_decode_metadata(attn_metadata, graph_request_count)
-        return attn_metadata
+        return attach_gdn_execution_plan(attn_metadata)
 
     def _build_prefill_has_initial_state_and_causal_conv1d_meta(
         self,

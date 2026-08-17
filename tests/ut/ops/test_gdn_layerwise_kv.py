@@ -127,6 +127,27 @@ def _make_prefill_metadata(device: torch.device | str = "cpu") -> GDNAttentionMe
     return metadata
 
 
+def test_profile_run_resolves_fused_chunk_capability_before_real_requests():
+    model = _GDNForwardWrapper()
+    forward_context = ForwardContext(
+        no_compile_layers={model.prefix: model},
+        attn_metadata=None,
+        slot_mapping={},
+    )
+    mixed_qkv = torch.zeros(2, 2)
+    b = torch.zeros(2, 1)
+    a = torch.zeros(2, 1)
+    output = torch.zeros(2, 1, 2)
+
+    with (
+        override_forward_context(forward_context),
+        patch.object(AscendGatedDeltaNetAttention, "_probe_fused_chunk") as probe,
+    ):
+        model._forward_core(mixed_qkv, b, a, output)
+
+    probe.assert_called_once_with()
+
+
 def test_connector_observes_updated_gdn_state_for_each_compiled_call():
     # vLLM registers this production dispatcher for NPU only. Keep a CPU
     # registration alive for this test so Inductor sees the same custom op.

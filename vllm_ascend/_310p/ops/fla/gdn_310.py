@@ -18,9 +18,7 @@
 
 
 import torch
-from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
-from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
@@ -28,7 +26,7 @@ from vllm_ascend._310p.ops.fla.chunk_gated_delta_rule import chunk_gated_delta_r
 from vllm_ascend._310p.ops.fla.fused_gdn_gating import fused_gdn_gating_pytorch
 from vllm_ascend._310p.ops.fla.l2norm import l2norm_310p
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
+from vllm_ascend.ops.gdn_execution import GDNExecutionPlan, execute_gdn_core
 from vllm_ascend.utils import enable_sp
 
 
@@ -197,233 +195,251 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
         b: torch.Tensor,
         a: torch.Tensor,
         core_attn_out: torch.Tensor,
-    ):
-        # Core attention computation (called by custom op).
+    ) -> None:
+        execute_gdn_core(
+            self,
+            _GDN_310_EXECUTION_ADAPTER,
+            mixed_qkv,
+            b,
+            a,
+            core_attn_out,
+        )
 
-        # NOTE: The processing logic of Qwen3_5GatedDeltaNet is the same as Qwen3NextGatedDeltaNet.
-        # However, because the ops `torch_npu.npu_recurrent_gated_delta_rule`
-        # currently does not support `ssm_state` inputs in float32 format,
-        # we temporarily retain the current _forward_core implementation.
-        # Once the ops supports float32 `ssm_state`, this patch should be removed.
 
-        forward_context = get_forward_context()
-        attn_metadata: AttentionMetadata = forward_context.attn_metadata
+class _GDN310ExecutionAdapter:
+    """310P kernels and state layouts behind the shared GDN execution seam."""
 
-        if attn_metadata is None:
-            # V1 profile run
-            return
+    split_mixed_non_spec_decode = False
 
-        assert isinstance(attn_metadata, dict)
-        attn_metadata = attn_metadata[self.prefix]
-        assert isinstance(attn_metadata, GDNAttentionMetadata)
-        has_initial_state = attn_metadata.has_initial_state
-        spec_query_start_loc = attn_metadata.spec_query_start_loc
-        non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
-        spec_sequence_masks = attn_metadata.spec_sequence_masks
-        spec_token_indx = attn_metadata.spec_token_indx
-        non_spec_token_indx = attn_metadata.non_spec_token_indx
-        spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
-        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
-        self_kv_cache = self.kv_cache
-        conv_state = self_kv_cache[0]
-        ssm_state = self_kv_cache[1]
-        num_actual_tokens = attn_metadata.num_actual_tokens
+    def initialize_capabilities(self, layer: AscendGatedDeltaNetAttention310) -> None:
+        del layer
 
-        if not enable_sp():
-            mixed_qkv = mixed_qkv[:num_actual_tokens]
-            b = b[:num_actual_tokens]
-            a = a[:num_actual_tokens]
+    def prepare_inputs(
+        self,
+        plan: GDNExecutionPlan,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if enable_sp():
+            return mixed_qkv, b, a
+        return (
+            mixed_qkv[: plan.num_actual_tokens],
+            b[: plan.num_actual_tokens],
+            a[: plan.num_actual_tokens],
+        )
 
-        # 1. Convolution sequence transformation
-        conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2)).transpose(0, 1)
-        if spec_sequence_masks is not None:
-            if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
-                mixed_qkv_spec = mixed_qkv
-                mixed_qkv_non_spec = None
-            else:
-                mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
-                mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
-        else:
-            mixed_qkv_spec = None
-            mixed_qkv_non_spec = mixed_qkv
-        activation_num = 1 if self.activation else 0
+    @staticmethod
+    def _conv_weights(layer: AscendGatedDeltaNetAttention310) -> torch.Tensor:
+        return layer.conv1d.weight.view(
+            layer.conv1d.weight.size(0),
+            layer.conv1d.weight.size(2),
+        ).transpose(0, 1)
 
-        # 1.1: Process the multi-query part
-        if spec_sequence_masks is not None:
-            spec_causal_conv1d_meta = attn_metadata.spec_decode_metadata.spec_causal_conv1d
-            spec_query_start_loc_device = spec_causal_conv1d_meta.query_start_loc
-            uniform_spec_only = attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0
-            # The final entry remains the runtime token count even when
-            # graph metadata includes padded requests.
-            spec_valid_tokens = spec_query_start_loc_device[-1]
-            if uniform_spec_only:
-                mixed_qkv_spec = _zero_padded_tokens(
-                    mixed_qkv_spec,
-                    spec_valid_tokens,
-                    token_dim=0,
-                )
-            mixed_qkv_spec = torch.ops._C_ascend.npu_causal_conv1d_310(
-                mixed_qkv_spec,
-                conv_weights,
-                bias=self.conv1d.bias,
-                conv_states=conv_state,
-                query_start_loc=spec_query_start_loc_device,
-                cache_indices=spec_causal_conv1d_meta.cache_indices,
-                initial_state_mode=None,
-                num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens,
-                activation_mode=activation_num,
-                pad_slot_id=PAD_SLOT_ID,
-                run_mode=1,
+    def causal_conv_spec(
+        self,
+        layer: AscendGatedDeltaNetAttention310,
+        metadata: GDNAttentionMetadata,
+        plan: GDNExecutionPlan,
+        mixed_qkv: torch.Tensor,
+    ) -> torch.Tensor:
+        spec_metadata = metadata.spec_decode_metadata.spec_causal_conv1d
+        if plan.is_uniform_spec_decode:
+            mixed_qkv = _zero_padded_tokens(
+                mixed_qkv,
+                spec_metadata.query_start_loc[-1],
+                token_dim=0,
             )
+        return torch.ops._C_ascend.npu_causal_conv1d_310(
+            mixed_qkv,
+            self._conv_weights(layer),
+            bias=layer.conv1d.bias,
+            conv_states=layer.kv_cache[0],
+            query_start_loc=spec_metadata.query_start_loc,
+            cache_indices=spec_metadata.cache_indices,
+            initial_state_mode=None,
+            num_accepted_tokens=spec_metadata.num_accepted_tokens,
+            activation_mode=1 if layer.activation else 0,
+            pad_slot_id=PAD_SLOT_ID,
+            run_mode=1,
+        )
 
-        # 1.2: Process the remaining part
-        if attn_metadata.num_prefills > 0:
-            if mixed_qkv_non_spec is not None:
-                mixed_qkv_non_spec = torch.ops._C_ascend.npu_causal_conv1d_310(
-                    mixed_qkv_non_spec,
-                    conv_weights,
-                    bias=self.conv1d.bias,
-                    conv_states=conv_state,
-                    query_start_loc=non_spec_query_start_loc,
-                    cache_indices=non_spec_state_indices_tensor,
-                    initial_state_mode=has_initial_state,
-                    num_accepted_tokens=None,
-                    activation_mode=activation_num,
-                    pad_slot_id=PAD_SLOT_ID,
-                    run_mode=0,
-                )
-        elif attn_metadata.num_decodes > 0:
-            mixed_qkv_non_spec = torch.ops._C_ascend.npu_causal_conv1d_310(
-                mixed_qkv_non_spec,
-                conv_weights,
-                bias=self.conv1d.bias,
-                conv_states=conv_state,
-                query_start_loc=None,
-                cache_indices=non_spec_state_indices_tensor[: attn_metadata.num_actual_tokens],
-                initial_state_mode=None,
-                num_accepted_tokens=None,
-                activation_mode=activation_num,
-                pad_slot_id=PAD_SLOT_ID,
-                run_mode=1,
-            )
-        else:
-            mixed_qkv_non_spec = None
-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
-        query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
+    def causal_conv_prefill(
+        self,
+        layer: AscendGatedDeltaNetAttention310,
+        metadata: GDNAttentionMetadata,
+        mixed_qkv: torch.Tensor,
+    ) -> torch.Tensor:
+        state_indices = metadata.non_spec_state_indices_tensor
+        assert state_indices is not None
+        return torch.ops._C_ascend.npu_causal_conv1d_310(
+            mixed_qkv,
+            self._conv_weights(layer),
+            bias=layer.conv1d.bias,
+            conv_states=layer.kv_cache[0],
+            query_start_loc=metadata.non_spec_query_start_loc,
+            cache_indices=state_indices,
+            initial_state_mode=metadata.has_initial_state,
+            num_accepted_tokens=None,
+            activation_mode=1 if layer.activation else 0,
+            pad_slot_id=PAD_SLOT_ID,
+            run_mode=0,
+        )
 
-        g, beta = fused_gdn_gating_pytorch(self.A_log, a, b, self.dt_bias)
-        if attn_metadata.num_prefills > 0 or spec_sequence_masks is not None:
-            if spec_sequence_masks is not None:
-                if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
-                    g_spec = g
-                    beta_spec = beta
-                    g_non_spec = None
-                    beta_non_spec = None
-                else:
-                    g_spec = g.index_select(1, spec_token_indx)
-                    beta_spec = beta.index_select(1, spec_token_indx)
-                    g_non_spec = g.index_select(1, non_spec_token_indx)
-                    beta_non_spec = beta.index_select(1, non_spec_token_indx)
-            else:
-                g_spec = None
-                beta_spec = None
-                g_non_spec = g
-                beta_non_spec = beta
+    def causal_conv_decode(
+        self,
+        layer: AscendGatedDeltaNetAttention310,
+        metadata: GDNAttentionMetadata,
+        mixed_qkv: torch.Tensor,
+    ) -> torch.Tensor:
+        state_indices = metadata.non_spec_state_indices_tensor
+        assert state_indices is not None
+        return torch.ops._C_ascend.npu_causal_conv1d_310(
+            mixed_qkv,
+            self._conv_weights(layer),
+            bias=layer.conv1d.bias,
+            conv_states=layer.kv_cache[0],
+            query_start_loc=None,
+            cache_indices=state_indices[: metadata.num_actual_tokens],
+            initial_state_mode=None,
+            num_accepted_tokens=None,
+            activation_mode=1 if layer.activation else 0,
+            pad_slot_id=PAD_SLOT_ID,
+            run_mode=1,
+        )
 
-            # 2. Recurrent attention
+    def gating(
+        self,
+        layer: AscendGatedDeltaNetAttention310,
+        a: torch.Tensor,
+        b: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return fused_gdn_gating_pytorch(layer.A_log, a, b, layer.dt_bias)
 
-            # 2.1: Process the multi-query part
-            if spec_sequence_masks is not None:
-                core_attn_out_spec = npu_recurrent_gated_delta_rule_310(
-                    q=query_spec,
-                    k=key_spec,
-                    v=value_spec,
-                    g=g_spec,
-                    beta=beta_spec,
-                    state=ssm_state,
-                    cu_seqlens=spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
-                    ssm_state_indices=spec_state_indices_tensor,
-                    num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens,
-                    use_qk_l2norm_in_kernel=True,
-                )
-            else:
-                core_attn_out_spec = None
+    def recurrent_spec(
+        self,
+        layer: AscendGatedDeltaNetAttention310,
+        metadata: GDNAttentionMetadata,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+    ) -> torch.Tensor:
+        spec_metadata = metadata.spec_decode_metadata.spec_causal_conv1d
+        return npu_recurrent_gated_delta_rule_310(
+            q=query,
+            k=key,
+            v=value,
+            g=g,
+            beta=beta,
+            state=layer.kv_cache[1],
+            cu_seqlens=metadata.spec_query_start_loc[: metadata.num_spec_decodes + 1],
+            ssm_state_indices=metadata.spec_state_indices_tensor,
+            num_accepted_tokens=spec_metadata.num_accepted_tokens,
+            use_qk_l2norm_in_kernel=True,
+        )
 
-            # 2.2: Process the remaining part
-            if attn_metadata.num_prefills > 0:
-                initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
-                initial_state[~has_initial_state, ...] = 0
-                (
-                    core_attn_out_non_spec,
-                    last_recurrent_state,
-                ) = chunk_gated_delta_rule_310(
-                    q=query_non_spec,
-                    k=key_non_spec,
-                    v=value_non_spec,
-                    g=g_non_spec,
-                    beta=beta_non_spec,
-                    initial_state=initial_state,
-                    output_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc,
-                    head_first=False,
-                    use_qk_l2norm_in_kernel=True,
-                )
+    def recurrent_decode(
+        self,
+        layer: AscendGatedDeltaNetAttention310,
+        metadata: GDNAttentionMetadata,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        mixed_batch: bool,
+    ) -> torch.Tensor:
+        del mixed_batch
+        return npu_recurrent_gated_delta_rule_310(
+            q=query,
+            k=key,
+            v=value,
+            g=g,
+            beta=beta,
+            state=layer.kv_cache[1],
+            cu_seqlens=metadata.non_spec_query_start_loc,
+            ssm_state_indices=metadata.non_spec_state_indices_tensor,
+            use_qk_l2norm_in_kernel=True,
+        )
 
-                # Init cache
-                ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(ssm_state.dtype)
-            elif attn_metadata.num_decodes > 0:
-                core_attn_out_non_spec = npu_recurrent_gated_delta_rule_310(
-                    q=query_non_spec,
-                    k=key_non_spec,
-                    v=value_non_spec,
-                    g=g_non_spec,
-                    beta=beta_non_spec,
-                    state=ssm_state,
-                    cu_seqlens=non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
-                    ssm_state_indices=non_spec_state_indices_tensor,
-                    use_qk_l2norm_in_kernel=True,
-                )
-            else:
-                core_attn_out_non_spec = None
+    def recurrent_prefill(
+        self,
+        layer: AscendGatedDeltaNetAttention310,
+        metadata: GDNAttentionMetadata,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        excludes_decode: bool,
+    ) -> torch.Tensor:
+        del excludes_decode
+        state_indices = metadata.non_spec_state_indices_tensor
+        has_initial_state = metadata.has_initial_state
+        assert state_indices is not None
+        assert has_initial_state is not None
+        initial_state = layer.kv_cache[1][state_indices].contiguous()
+        initial_state[~has_initial_state, ...] = 0
+        output, last_state = chunk_gated_delta_rule_310(
+            q=query,
+            k=key,
+            v=value,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=metadata.non_spec_query_start_loc,
+            head_first=False,
+            use_qk_l2norm_in_kernel=True,
+        )
+        layer.kv_cache[1][state_indices] = last_state.to(layer.kv_cache[1].dtype)
+        return output
 
-        elif attn_metadata.num_decodes > 0:
-            core_attn_out_non_spec = npu_recurrent_gated_delta_rule_310(
-                q=query_non_spec,
-                k=key_non_spec,
-                v=value_non_spec,
-                g=g,
-                beta=beta,
-                state=ssm_state,
-                cu_seqlens=non_spec_query_start_loc,
-                ssm_state_indices=non_spec_state_indices_tensor,
-                use_qk_l2norm_in_kernel=True,
-            )
-        # 3. Merge core attention output
-        if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
-            _merge_spec_and_non_spec_outputs_310(
-                core_attn_out,
-                num_actual_tokens,
-                spec_token_indx,
-                non_spec_token_indx,
-                core_attn_out_spec,
-                core_attn_out_non_spec,
-            )
-        elif spec_sequence_masks is not None:
-            if not enable_sp():
-                core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
-            else:
-                core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)[:num_actual_tokens]
-        else:
-            if not enable_sp():
-                core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
-            else:
-                core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)[:num_actual_tokens]
-        if spec_sequence_masks is not None and uniform_spec_only:
-            core_attn_out.copy_(
+    def write_mixed_output(
+        self,
+        output: torch.Tensor,
+        plan: GDNExecutionPlan,
+        spec_output: torch.Tensor,
+        non_spec_output: torch.Tensor,
+    ) -> None:
+        assert plan.spec_token_indices is not None
+        assert plan.non_spec_token_indices is not None
+        _merge_spec_and_non_spec_outputs_310(
+            output,
+            plan.num_actual_tokens,
+            plan.spec_token_indices,
+            plan.non_spec_token_indices,
+            spec_output,
+            non_spec_output,
+        )
+
+    def write_single_output(
+        self,
+        output: torch.Tensor,
+        plan: GDNExecutionPlan,
+        value: torch.Tensor,
+    ) -> None:
+        value = value.squeeze(0)
+        if enable_sp():
+            value = value[: plan.num_actual_tokens]
+        output[: plan.num_actual_tokens] = value
+
+    def finalize_output(
+        self,
+        output: torch.Tensor,
+        metadata: GDNAttentionMetadata,
+        plan: GDNExecutionPlan,
+    ) -> None:
+        if plan.is_uniform_spec_decode:
+            output.copy_(
                 _zero_padded_tokens(
-                    core_attn_out,
-                    spec_valid_tokens,
+                    output,
+                    metadata.spec_decode_metadata.spec_causal_conv1d.query_start_loc[-1],
                     token_dim=0,
                 )
             )
-        maybe_save_kv_layer_to_connector("", [])
+
+
+_GDN_310_EXECUTION_ADAPTER = _GDN310ExecutionAdapter()
