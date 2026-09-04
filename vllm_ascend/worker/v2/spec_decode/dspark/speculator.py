@@ -27,6 +27,7 @@ from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
     DSparkSpeculator,
 )
 
+from vllm_ascend.models.dspark_aux import DSparkAuxHiddenContract
 from vllm_ascend.models.qwen3_dspark import process_weight
 from vllm_ascend.utils import (
     get_rotation_matrix,
@@ -45,6 +46,7 @@ class AscendDSparkSpeculator(DSparkSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
         self.input_batch: InputBatch | None = None
+        self.aux_hidden_contract: DSparkAuxHiddenContract | None = None
 
     def load_draft_model(
         self,
@@ -64,6 +66,27 @@ class AscendDSparkSpeculator(DSparkSpeculator):
             fc = model.model.fc
             with torch.no_grad():
                 fc.weight.data.copy_(process_weight(fc.weight.data.cpu(), rotation_weight))
+
+        get_contract = getattr(
+            model,
+            "get_required_dspark_aux_hidden_state_contract",
+            None,
+        )
+        if get_contract is not None:
+            contract = get_contract()
+            configure_target = getattr(
+                target_model,
+                "configure_dspark_aux_hidden_state_contract",
+                None,
+            )
+            if configure_target is None:
+                raise ValueError(
+                    f"DSpark draft {type(model).__name__} requires auxiliary hidden "
+                    f"format {contract.format.value}, but target {type(target_model).__name__} "
+                    "does not expose the DSpark auxiliary-hidden-state contract capability"
+                )
+            configure_target(contract)
+            self.aux_hidden_contract = contract
         return model
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
@@ -176,6 +199,12 @@ class AscendDSparkSpeculator(DSparkSpeculator):
         self.input_batch = input_batch
         assert self.input_batch is not None
         sync_state = num_tokens_across_dp if vllm_version_is("0.28.0") else dp_sync
+        if self.aux_hidden_contract is not None:
+            self.aux_hidden_contract.validate_runtime(
+                aux_hidden_states,
+                num_target_tokens=input_batch.num_tokens,
+                target_device=last_hidden_states.device,
+            )
         with (
             build_attn_metadata_wrapper(),
             build_draft_attn_metadata_factory(
