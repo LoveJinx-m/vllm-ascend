@@ -324,8 +324,10 @@ def k3_runtime(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) 
 
 def _engine_args(models: dict[str, str], variant: str, tp: int = 4) -> dict:
     steps = 5 if variant == "mla_block5" else 7
-    # Respect upstream LCM(TP, speculative query width), including Block5's 48.
-    graph_sizes = [48, 96] if steps == 5 else [16, 32]
+    # Target verification uses N+1 rows per request. Keep request buckets 2/4
+    # while satisfying TP4 alignment; DSpark derives its independent N-row
+    # draft capture sizes from these target buckets.
+    graph_sizes = [12, 24] if steps == 5 else [16, 32]
     return {
         "load_format": "dummy",
         "dtype": "bfloat16",
@@ -431,21 +433,56 @@ def _get_full_graph_replay_count(worker) -> int:
     return manager._k3_test_replay_count
 
 
+def _install_dspark_graph_replay_counter(worker) -> bool:
+    manager = worker.model_runner.speculator.query_cudagraph_manager
+    assert manager is not None
+    original_run_fullgraph = manager.run_fullgraph
+    manager._k3_test_replay_count = 0
+
+    def tracked_run_fullgraph(self, desc):
+        self._k3_test_replay_count += 1
+        return original_run_fullgraph(desc)
+
+    manager.run_fullgraph = MethodType(tracked_run_fullgraph, manager)
+    return True
+
+
+def _get_dspark_graph_replay_count(worker) -> int:
+    manager = worker.model_runner.speculator.query_cudagraph_manager
+    assert manager is not None
+    return manager._k3_test_replay_count
+
+
+def _get_dspark_graph_capture_sizes(worker) -> list[int]:
+    manager = worker.model_runner.speculator.query_cudagraph_manager
+    assert manager is not None
+    return manager.capture_sizes
+
+
 def _run_k3_mrv2_mla_dspark_eager(
     k3_models: dict[str, str],
     *,
     variant: str,
     with_draft: bool,
+    draft_enforce_eager: bool = True,
 ) -> dict[str, tuple[tuple[int, ...], ...]]:
     args = _engine_args(k3_models, variant)
     args["max_model_len"] = PREFIX_CACHE_MODEL_LEN
-    args["enforce_eager"] = True
-    args["compilation_config"] = {"cudagraph_mode": "NONE"}
+    args["enforce_eager"] = draft_enforce_eager
+    if draft_enforce_eager:
+        args["compilation_config"] = {"cudagraph_mode": "NONE"}
     if not with_draft:
         del args["speculative_config"]
+    else:
+        args["speculative_config"]["enforce_eager"] = draft_enforce_eager
 
     with VllmRunner(k3_models["target"], **args) as runner:
         llm = runner.model
+        if with_draft and not draft_enforce_eager:
+            assert all(llm.collective_rpc(_install_dspark_graph_replay_counter))
+            expected_capture_sizes = [10, 20] if variant == "mla_block5" else [14, 28]
+            capture_sizes = llm.collective_rpc(_get_dspark_graph_capture_sizes)
+            assert capture_sizes and all(sizes == expected_capture_sizes for sizes in capture_sizes)
         boundary = _generate(
             llm,
             [_prompt(length, salt=i * 137) for i, length in enumerate((127, 128, 129, 769))],
@@ -471,6 +508,9 @@ def _run_k3_mrv2_mla_dspark_eager(
         if with_draft:
             drafts = [m for m in llm.get_metrics() if m.name == "vllm:spec_decode_num_drafts"]
             assert drafts and sum(m.value for m in drafts) > 0, "Requests bypassed MLA DSpark"
+            if not draft_enforce_eager:
+                replay_counts = llm.collective_rpc(_get_dspark_graph_replay_count)
+                assert replay_counts and all(count > 0 for count in replay_counts)
 
         return {
             "boundary": _token_ids(boundary),
@@ -480,11 +520,23 @@ def _run_k3_mrv2_mla_dspark_eager(
 
 @pytest.mark.parametrize("k3_runtime", ["1"], indirect=True, ids=["mrv2"])
 @pytest.mark.parametrize("variant", ["mla", "mla_block5"])
-def test_k3_mrv2_mla_dspark_eager(k3_models: dict[str, str], variant: str) -> None:
+def test_k3_mrv2_mla_dspark_eager(
+    k3_models: dict[str, str],
+    variant: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     no_spec = _run_k3_mrv2_mla_dspark_eager(k3_models, variant=variant, with_draft=False)
     mla_dspark = _run_k3_mrv2_mla_dspark_eager(k3_models, variant=variant, with_draft=True)
+    mla_dspark_graph = _run_k3_mrv2_mla_dspark_eager(
+        k3_models,
+        variant=variant,
+        with_draft=True,
+        draft_enforce_eager=False,
+    )
 
     assert mla_dspark == no_spec
+    assert mla_dspark_graph == mla_dspark
 
 
 def _run_k3_mrv2_target(k3_models: dict[str, str], *, enforce_eager: bool) -> dict[str, tuple[tuple[int, ...], ...]]:

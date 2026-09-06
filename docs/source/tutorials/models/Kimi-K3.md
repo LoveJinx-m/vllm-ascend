@@ -354,14 +354,18 @@ Add the same speculative configuration to the Node 0 and headless worker command
   "num_speculative_tokens": 7,
   "draft_tensor_parallel_size": 16,
   "max_model_len": 4096,
-  "draft_sample_method": "greedy",
-  "enforce_eager": true
+  "draft_sample_method": "greedy"
 }'
 ```
 
 The example proposes seven draft tokens in one query block, followed by
 target-model verification.
 Set `draft_tensor_parallel_size` to the topology used to shard the draft model.
+With the v2 model runner, the MLA DSpark backbone and sequential Markov sampling
+are captured by the draft `FULL_DECODE_ONLY` ACL Graph. Add
+`"enforce_eager": true` only when isolating a graph-related failure. MLA DSpark
+ACL Graph support is independent of the target-model graph and does not imply
+GQA draft graph support.
 
 ## 6 Functional Verification
 

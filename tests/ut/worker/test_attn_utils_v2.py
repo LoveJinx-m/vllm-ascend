@@ -268,6 +268,37 @@ def test_build_draft_attn_metadata_forwards_ascend_context(monkeypatch):
     assert captured_kwargs["attn_state"] is AscendAttentionState.SpecDecoding
 
 
+def test_build_draft_attn_metadata_supports_graph_capture_module():
+    captured_kwargs = {}
+
+    def raw_build_attn_metadata(*_args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return "capture-metadata"
+
+    capture_module = SimpleNamespace(build_attn_metadata=raw_build_attn_metadata)
+    positions = torch.arange(16, dtype=torch.int32)
+
+    def capture_is_prefilling(num_reqs: int) -> torch.Tensor:
+        return torch.zeros(num_reqs, dtype=torch.bool)
+
+    with attn_utils.build_draft_attn_metadata_factory(
+        positions,
+        pad=None,
+        is_prefilling=capture_is_prefilling,
+        module=capture_module,
+    ):
+        metadata = capture_module.build_attn_metadata(num_reqs=4, num_tokens=12)
+
+    assert metadata == "capture-metadata"
+    torch.testing.assert_close(captured_kwargs["positions"], positions[:12])
+    torch.testing.assert_close(
+        captured_kwargs["is_prefilling"],
+        torch.zeros(4, dtype=torch.bool),
+    )
+    assert captured_kwargs["attn_state"] is AscendAttentionState.SpecDecoding
+    assert capture_module.build_attn_metadata is raw_build_attn_metadata
+
+
 @pytest.mark.parametrize(
     ("replicated_indexer", "expected_size"),
     [(False, 1), (True, 4)],

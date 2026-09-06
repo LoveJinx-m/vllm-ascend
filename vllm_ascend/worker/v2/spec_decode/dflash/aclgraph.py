@@ -2,6 +2,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
+import vllm.v1.worker.gpu.spec_decode.dflash.cudagraph as dflash_cudagraph_module
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import get_forward_context, set_forward_context
@@ -20,6 +21,7 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.worker.v2.aclgraph_utils import collect_sorted_captured_token_sizes, model_capture_wrapper
+from vllm_ascend.worker.v2.attn_utils import build_draft_attn_metadata_factory
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -66,7 +68,25 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
         """Capture ACL graphs for DFlash."""
-        with communicator_switch(), model_capture_wrapper(self.speculator, False):
+        if self.speculator is None:
+            raise RuntimeError("The draft speculator must be attached before ACLGraph capture.")
+
+        def capture_is_prefilling(num_reqs: int) -> torch.Tensor:
+            # Parallel-draft query graphs contain decode/speculative rows only.
+            # Use an explicit request-sized tensor so padded capture rows cannot
+            # inherit stale prefill flags from a previous runtime batch.
+            return torch.zeros(num_reqs, dtype=torch.bool)
+
+        with (
+            communicator_switch(),
+            model_capture_wrapper(self.speculator, False),
+            build_draft_attn_metadata_factory(
+                input_buffers.positions,
+                pad=None,
+                is_prefilling=capture_is_prefilling,
+                module=dflash_cudagraph_module,
+            ),
+        ):
             super().capture(
                 forward_fn,
                 input_buffers,
@@ -81,6 +101,17 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
         num_tokens = desc.num_tokens
+        if self.speculator is None:
+            raise RuntimeError("The draft speculator must be attached before ACLGraph replay.")
+        if desc.num_reqs is None:
+            raise ValueError("DFlash full graphs require a padded request count.")
+        expected_num_tokens = desc.num_reqs * self.decode_query_len
+        if num_tokens != expected_num_tokens:
+            raise ValueError(
+                "DFlash graph descriptor is not a uniform draft batch: "
+                f"num_tokens={num_tokens}, num_reqs={desc.num_reqs}, "
+                f"decode_query_len={self.decode_query_len}."
+            )
 
         draft_attn_metadatas = self.speculator.build_draft_attn_metadatas(
             desc.num_reqs,
@@ -111,9 +142,19 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
 
             forward_context = get_forward_context()
 
+            attn_backend = getattr(self.speculator, "attn_backend", None)
+            if attn_backend is None:
+                unique_backends = set(self.speculator.attn_backends.values())
+                if len(unique_backends) != 1:
+                    backend_names = sorted(backend.__name__ for backend in unique_backends)
+                    raise RuntimeError(
+                        "DFlash ACLGraph requires one homogeneous draft "
+                        "attention backend, but found "
+                        f"{backend_names or ['none']}."
+                    )
+                attn_backend = next(iter(unique_backends))
             update_full_graph_params(
-                # FIXME(Ronald1995): support hybrid attn backend
-                list(self.speculator.attn_backends.values())[0],
+                attn_backend,
                 self.update_stream,
                 forward_context,
                 num_tokens,

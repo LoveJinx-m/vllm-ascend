@@ -17,7 +17,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
@@ -1217,26 +1217,37 @@ def build_attn_metadata_wrapper():
 
 
 @contextmanager
-def build_draft_attn_metadata_factory(positions, pad, is_prefilling):
+def build_draft_attn_metadata_factory(
+    positions: torch.Tensor,
+    pad: int | None,
+    is_prefilling: torch.Tensor | Callable[[int], torch.Tensor],
+    *,
+    module: Any | None = None,
+):
     """Wrap build_attn_metadata with Ascend draft-model context.
 
     The generic (Ascend) ``build_attn_metadata`` reads ``positions`` inside the
     DSA/MLA ``build_decode_metadata`` for cos/sin, but the flat upstream
     speculator path does not forward them or the Ascend attention state. The
     latter must be ``SpecDecoding`` so MLA uses the token-major speculative
-    path instead of treating draft tokens as independent requests. Must run inside
-    ``build_attn_metadata_wrapper()``.
+    path instead of treating draft tokens as independent requests. ``module``
+    defaults to the upstream speculator module used by eager execution. DFlash
+    graph capture builds metadata in its cudagraph module instead, so capture
+    callers pass that module and use ``pad=None`` to take the token count from
+    each graph descriptor.
     """
-    raw = _BUILD_ATTN_METADATA_MODULE.build_attn_metadata  # cache
+    target_module = module or _BUILD_ATTN_METADATA_MODULE
+    raw = target_module.build_attn_metadata
 
     def build_attn_metadata(*args, **kwargs):
-        kwargs["positions"] = positions[:pad]
-        kwargs["is_prefilling"] = is_prefilling
+        num_tokens = kwargs["num_tokens"] if pad is None else pad
+        kwargs["positions"] = positions[:num_tokens]
+        kwargs["is_prefilling"] = is_prefilling(kwargs["num_reqs"]) if callable(is_prefilling) else is_prefilling
         kwargs["attn_state"] = AscendAttentionState.SpecDecoding
         return raw(*args, **kwargs)
 
     try:
-        _BUILD_ATTN_METADATA_MODULE.build_attn_metadata = build_attn_metadata
+        target_module.build_attn_metadata = build_attn_metadata
         yield
     finally:
-        _BUILD_ATTN_METADATA_MODULE.build_attn_metadata = raw  # restore
+        target_module.build_attn_metadata = raw

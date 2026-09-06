@@ -22,6 +22,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
@@ -32,6 +33,8 @@ from vllm_ascend.models.dspark_aux import (
 )
 from vllm_ascend.worker.v2.spec_decode.dspark.speculator import (
     AscendDSparkSpeculator,
+    _copy_config_with_draft_capture_sizes,
+    _derive_draft_capture_sizes,
 )
 
 _HIDDEN = 8
@@ -144,3 +147,100 @@ class TestLoadDraftModel:
 
         with pytest.raises(ValueError, match="does not expose"):
             _spec(_bf16_config()).load_draft_model(SimpleNamespace(), set())
+
+
+@pytest.mark.parametrize(
+    ("capture_sizes", "target_query_len", "draft_query_len", "expected"),
+    [
+        ([16, 32], 8, 7, [14, 28]),
+        ([12, 24], 6, 5, [10, 20]),
+        ([1, 2, 4], 8, 7, []),
+    ],
+)
+def test_derive_draft_capture_sizes_preserves_target_request_buckets(
+    capture_sizes,
+    target_query_len,
+    draft_query_len,
+    expected,
+):
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            cudagraph_capture_sizes=capture_sizes,
+            max_cudagraph_capture_size=max(capture_sizes),
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+    )
+
+    assert (
+        _derive_draft_capture_sizes(
+            config,
+            target_query_len,
+            draft_query_len,
+        )
+        == expected
+    )
+
+
+def test_copy_config_with_draft_capture_sizes_preserves_runtime_state():
+    static_forward_context = {"draft.mla": object()}
+    compilation_config = SimpleNamespace(
+        cudagraph_capture_sizes=[16, 32],
+        max_cudagraph_capture_size=32,
+        static_forward_context=static_forward_context,
+    )
+    config = SimpleNamespace(compilation_config=compilation_config)
+
+    draft_config = _copy_config_with_draft_capture_sizes(config, [14, 28])
+
+    assert draft_config is not config
+    assert draft_config.compilation_config is not compilation_config
+    assert draft_config.compilation_config.cudagraph_capture_sizes == [14, 28]
+    assert draft_config.compilation_config.max_cudagraph_capture_size == 28
+    assert draft_config.compilation_config.static_forward_context is static_forward_context
+    assert compilation_config.cudagraph_capture_sizes == [16, 32]
+    assert compilation_config.max_cudagraph_capture_size == 32
+
+
+def test_update_draft_attn_metadata_updates_mla_decode_schema():
+    spec = AscendDSparkSpeculator.__new__(AscendDSparkSpeculator)
+    spec.num_query_per_req = 7
+    mla_metadata = SimpleNamespace(
+        decode=SimpleNamespace(actual_seq_lengths_q=[7, 14]),
+    )
+
+    updated = spec._update_draft_attn_metadata(
+        {"draft.mla": mla_metadata},
+        num_reqs_padded=4,
+    )
+
+    assert updated["draft.mla"] is mla_metadata
+    assert mla_metadata.decode.actual_seq_lengths_q == [7, 14, 21, 28]
+    assert not hasattr(mla_metadata, "actual_seq_lengths_q")
+
+
+def test_update_draft_attn_metadata_keeps_gqa_schema_compatible():
+    spec = AscendDSparkSpeculator.__new__(AscendDSparkSpeculator)
+    spec.num_query_per_req = 5
+    gqa_metadata = SimpleNamespace(actual_seq_lengths_q=[5])
+
+    spec._update_draft_attn_metadata(
+        {"draft.gqa": gqa_metadata},
+        num_reqs_padded=3,
+    )
+
+    assert gqa_metadata.actual_seq_lengths_q == [5, 10, 15]
+
+
+def test_build_draft_is_prefilling_zeros_padded_requests():
+    spec = AscendDSparkSpeculator.__new__(AscendDSparkSpeculator)
+    spec.input_batch = SimpleNamespace(
+        num_reqs=2,
+        is_prefilling_np=np.array([True, False, True, True]),
+    )
+
+    is_prefilling = spec._build_draft_is_prefilling(4)
+
+    torch.testing.assert_close(
+        is_prefilling,
+        torch.tensor([True, False, False, False]),
+    )
