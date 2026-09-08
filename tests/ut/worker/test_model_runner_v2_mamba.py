@@ -92,14 +92,19 @@ def _group(spec: MambaSpec):
     )
 
 
-def test_validate_dense_and_packed_kv_cache_tensor_layouts():
+@pytest.mark.skipif(vllm_version_is("0.28.0"), reason="Standardized backing is a main API")
+@pytest.mark.parametrize("block_outermost", [False, True])
+def test_validate_overlaid_kv_cache_tensor_layouts(block_outermost):
     attention_spec = FullAttentionSpec(block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float16)
     mamba_spec = MambaSpec(block_size=4, shapes=((4,),), dtypes=(torch.float32,))
     assert attention_spec.page_size_bytes == mamba_spec.page_size_bytes == 16
 
     dense = KVCacheConfig(
         num_blocks=3,
-        kv_cache_tensors=[KVCacheTensor(size=48, shared_by=["attn", "mamba"])],
+        kv_cache_tensors=[
+            _make_kv_cache_tensor(48, ["attn"], 16),
+            _make_kv_cache_tensor(48, ["mamba"], 16),
+        ],
         kv_cache_groups=[
             KVCacheGroupSpec(layer_names=["attn"], kv_cache_spec=attention_spec),
             KVCacheGroupSpec(layer_names=["mamba"], kv_cache_spec=mamba_spec),
@@ -107,44 +112,66 @@ def test_validate_dense_and_packed_kv_cache_tensor_layouts():
     )
     validate_kv_cache_tensor_layouts(dense)
 
+    # Two layers within one group occupy separate regions; other groups may
+    # overlay those regions, even when their stride or page size differs.
     packed = replace(
         dense,
         kv_cache_tensors=[
-            KVCacheTensor(size=96, shared_by=["attn"], offset=0, block_stride=32),
-            KVCacheTensor(size=96, shared_by=["mamba"], offset=16, block_stride=32),
+            _make_kv_cache_tensor(96, ["attn"], 32 if block_outermost else 16, offset=0),
+            _make_kv_cache_tensor(96, ["mamba"], 32 if block_outermost else 16, offset=16 if block_outermost else 48),
         ],
     )
     validate_kv_cache_tensor_layouts(packed)
 
 
+@pytest.mark.skipif(vllm_version_is("0.28.0"), reason="Standardized backing is a main API")
+def test_validate_standardized_layers_and_different_group_strides():
+    spec = FullAttentionSpec(block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float16)
+    config = KVCacheConfig(
+        num_blocks=3,
+        kv_cache_tensors=[
+            _make_kv_cache_tensor(96, ["a", "b"], 16, layer_stride=48),
+            _make_kv_cache_tensor(96, ["c"], 32),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=["a", "b"], kv_cache_spec=spec),
+            KVCacheGroupSpec(layer_names=["c"], kv_cache_spec=spec),
+        ],
+    )
+    validate_kv_cache_tensor_layouts(config)
+    invalid = replace(config, kv_cache_tensors=[replace(config.kv_cache_tensors[0], layer_stride=64)])
+    with pytest.raises(ValueError, match="exceeds backing"):
+        validate_kv_cache_tensor_layouts(invalid)
+
+
+@pytest.mark.skipif(vllm_version_is("0.28.0"), reason="Standardized backing is a main API")
 @pytest.mark.parametrize(
     ("tensors", "error"),
     [
-        ([KVCacheTensor(size=47, shared_by=["attn"])], "dense layout size"),
-        ([KVCacheTensor(size=48, shared_by=["attn"], offset=1)], "offset without a packed"),
-        ([KVCacheTensor(size=48, shared_by=["missing"])], "unknown layer"),
+        ([_make_kv_cache_tensor(47, ["attn"], 16)], "exceeds backing"),
+        ([_make_kv_cache_tensor(48, ["attn"], 16, offset=-1)], "nonnegative"),
+        ([_make_kv_cache_tensor(48, ["missing"], 16)], "unknown layer"),
         (
             [
-                KVCacheTensor(size=48, shared_by=["attn"]),
-                KVCacheTensor(size=48, shared_by=["attn"]),
+                _make_kv_cache_tensor(48, ["attn"], 16),
+                _make_kv_cache_tensor(48, ["attn"], 16),
             ],
             "multiple storage owners",
         ),
-        ([KVCacheTensor(size=64, shared_by=["attn"], block_stride=16)], "packed layout size"),
-        ([KVCacheTensor(size=96, shared_by=["attn"], offset=20, block_stride=32)], "page range"),
+        ([_make_kv_cache_tensor(48, ["attn"], 8)], "smaller than page size"),
+        ([_make_kv_cache_tensor(96, ["attn"], 32, offset=20)], "exceeds backing"),
         (
             [
-                KVCacheTensor(size=96, shared_by=["attn"], offset=0, block_stride=32),
-                KVCacheTensor(size=96, shared_by=["mamba"], offset=8, block_stride=32),
+                _make_kv_cache_tensor(48, ["attn", "attn"], 16),
             ],
-            "overlaps",
+            "repeats a layer",
         ),
         (
             [
-                KVCacheTensor(size=96, shared_by=["attn"], block_stride=32),
-                KVCacheTensor(size=144, shared_by=["mamba"], block_stride=48),
+                _make_kv_cache_tensor(96, ["attn"], 32),
+                _make_kv_cache_tensor(144, ["mamba"], 48),
             ],
-            "packed backing",
+            "shared backing size",
         ),
     ],
 )

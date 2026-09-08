@@ -8,8 +8,9 @@ SiTU activations, and latent MoE layers.
 
 This tutorial covers model preparation, installation, online serving, and
 accuracy and performance evaluation for the full W4A8 checkpoint on Atlas A3.
-This tutorial is based on **vLLM-Ascend main with vLLM 0.27.1**. Use a
-main-branch build with Kimi-K3 support and its matching vLLM revision.
+This tutorial targets **vLLM-Ascend main** and the vLLM revision recorded in
+`.github/vllm-main-verified.commit`. Pin both source commits when preparing
+the runtime; a floating nightly tag alone does not identify the tested code.
 
 ## 2 Supported Features
 
@@ -126,13 +127,12 @@ release versions in the generic examples.
 
 ### 4.3 Model Runner V2 Target-Only Validation
 
-The Model Runner V2 gates below target vLLM `v0.27.1` at commit
-`6e448d0ea9bf3d88d898b65449ca6dc2aec170ac`. Verify the source checkout before
-building the runtime image:
+The Model Runner V2 gates use the main-to-main pairing recorded by the
+checked-out Ascend source. Verify the vLLM checkout before building the runtime:
 
 ```shell
 test "$(git -C /vllm-workspace/vllm rev-parse HEAD)" = \
-  "6e448d0ea9bf3d88d898b65449ca6dc2aec170ac"
+  "$(cat /vllm-workspace/vllm-ascend/.github/vllm-main-verified.commit)"
 ```
 
 Set the following environment variable before starting a target-only MRV2
@@ -199,10 +199,9 @@ The functional test starts independent target-only and MLA DSpARK eager
 engines with the same seed. It compares exact token IDs across block boundaries
 and cold/repeated/reset requests with prefix caching enabled, and requires the
 draft-token metric to be non-zero so speculative decoding cannot be bypassed
-silently. The target-only oracle must report a real prefix-cache hit. vLLM
-0.27.1 does not report a reusable prefix-cache hit for the same request while
-DSpARK is enabled, so the draft run validates deterministic output but does not
-claim draft + prefix-cache state reuse.
+silently. The target-only oracle must report a real prefix-cache hit. The draft
+run validates deterministic output; draft + prefix-cache state reuse requires
+separate hit-metric and state-reuse evidence on the pinned runtime.
 
 This reduced dummy test does not validate checkpoint loading, QuaRot, draft
 acceptance patterns, or model accuracy. Before accepting the MLA eager gate,
@@ -211,8 +210,7 @@ for zero, partial, and full acceptance, block crossing, abort/request reuse,
 and deterministic parity with target-only eager. Prefix-cache state reuse while
 DSpARK is enabled also remains a separate follow-up gate. GQA DSpARK and draft
 ACL Graph remain separate follow-up scopes. Multimodal draft inputs are also
-deferred for this bring-up because vLLM 0.27.1 keeps DFlash multimodal capability
-disabled.
+outside the scope of this text-only bring-up.
 
 ## 5 Online Service Deployment
 

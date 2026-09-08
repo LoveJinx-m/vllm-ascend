@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Validate v0.27.1 DFlash semantics and the pinned-main signature shim."""
+"""Validate rejected-context masking against the release and main kernels."""
 
 import torch
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -83,7 +83,7 @@ def _run_prepare(*, positions: list[int], block_table_values: list[int]):
         max_num_tokens,
         128,
     )
-    if vllm_version_is("0.27.1"):
+    if vllm_version_is("0.28.0"):
         _prepare_dflash_inputs_kernel_ascend[(1, 1)](
             *args,
             SAMPLE_FROM_ANCHOR=True,

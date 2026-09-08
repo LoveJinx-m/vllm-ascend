@@ -25,6 +25,8 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
+from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
 from vllm_ascend.models.dspark_aux import (
@@ -199,6 +201,30 @@ def test_copy_config_with_draft_capture_sizes_preserves_runtime_state():
     assert draft_config.compilation_config.static_forward_context is static_forward_context
     assert compilation_config.cudagraph_capture_sizes == [16, 32]
     assert compilation_config.max_cudagraph_capture_size == 32
+
+
+@pytest.mark.parametrize("enforce_eager", [False, True])
+def test_graph_manager_respects_draft_enforce_eager(monkeypatch, enforce_eager):
+    spec = AscendDSparkSpeculator.__new__(AscendDSparkSpeculator)
+    spec.speculative_config = SimpleNamespace(enforce_eager=enforce_eager)
+    spec.attn_cg_support = SimpleNamespace(min_cg_support=AttentionCGSupport.UNIFORM_BATCH)
+    spec.model_state = SimpleNamespace(num_new_sampled_tokens_per_step=1)
+    spec.num_speculative_steps = 5
+    spec.num_query_per_req = 5
+    spec.device = torch.device("cpu")
+    spec.update_stream = object()
+    spec.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(cudagraph_capture_sizes=[6], max_cudagraph_capture_size=6),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+    )
+    manager = MagicMock()
+    monkeypatch.setattr("vllm_ascend.worker.v2.spec_decode.dspark.speculator.DFlashAclGraphManager", manager)
+    spec.init_cudagraph_manager(CUDAGraphMode.FULL_DECODE_ONLY)
+    expected = CUDAGraphMode.NONE if enforce_eager else CUDAGraphMode.FULL_DECODE_ONLY
+    assert manager.call_args.args[2] == expected
+    assert manager.call_args.kwargs["speculator"] is spec
+    assert manager.call_args.args[0].compilation_config.cudagraph_capture_sizes == [5]
+    assert spec.query_cudagraph_manager.update_stream is spec.update_stream
 
 
 def test_update_draft_attn_metadata_updates_mla_decode_schema():

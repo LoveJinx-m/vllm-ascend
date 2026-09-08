@@ -109,63 +109,59 @@ def validate_kv_cache_tensor_layouts(kv_cache_config: KVCacheConfig) -> None:
             specs_by_layer.update(dict.fromkeys(group.layer_names, group_spec))
 
     owners: set[str] = set()
-    packed_backing: tuple[int, int] | None = None
-    packed_ranges: list[tuple[int, int, str]] = []
+    backing_size: int | None = None
     for tensor_idx, kv_tensor in enumerate(kv_cache_config.kv_cache_tensors):
         label = f"KV cache tensor {tensor_idx}"
         if kv_tensor.size <= 0:
             raise ValueError(f"{label} size must be positive")
-        if not kv_tensor.shared_by:
+        layer_names = get_kv_cache_tensor_layers(kv_tensor)
+        if not layer_names:
             raise ValueError(f"{label} must own at least one layer")
 
-        duplicate_owners = owners.intersection(kv_tensor.shared_by)
+        duplicate_owners = owners.intersection(layer_names)
+        if len(layer_names) != len(set(layer_names)):
+            raise ValueError(f"{label} repeats a layer")
         if duplicate_owners:
             raise ValueError(f"KV cache layers have multiple storage owners: {sorted(duplicate_owners)}")
-        owners.update(kv_tensor.shared_by)
+        owners.update(layer_names)
 
         try:
-            page_sizes = {specs_by_layer[layer_name].page_size_bytes for layer_name in kv_tensor.shared_by}
+            page_sizes = {specs_by_layer[layer_name].page_size_bytes for layer_name in layer_names}
         except KeyError as exc:
             raise ValueError(f"{label} references unknown layer {exc.args[0]!r}") from exc
         if len(page_sizes) != 1:
             raise ValueError(f"{label} shares layers with different page sizes: {sorted(page_sizes)}")
         page_size = page_sizes.pop()
 
-        if kv_tensor.block_stride == 0:
-            if kv_tensor.offset != 0:
-                raise ValueError(f"{label} has an offset without a packed block stride")
+        if vllm_version_is("0.28.0"):
+            # Release descriptors alias complete per-layer allocations.
             expected_size = kv_cache_config.num_blocks * page_size
             if kv_tensor.size != expected_size:
                 raise ValueError(f"{label} size {kv_tensor.size} does not match dense layout size {expected_size}")
             continue
 
+        # Main descriptors are views into one common allocation. Different
+        # cache groups intentionally overlap: the scheduler assigns each block
+        # ID to only one group. Validate the bounds of each view, not separation
+        # between groups or equality of their block strides.
+        if backing_size is None:
+            backing_size = kv_tensor.size
+        elif backing_size != kv_tensor.size:
+            raise ValueError(f"{label} does not match the shared backing size {backing_size}")
         if kv_tensor.block_stride < page_size:
             raise ValueError(f"{label} block stride {kv_tensor.block_stride} is smaller than page size {page_size}")
-        if kv_tensor.offset < 0 or kv_tensor.offset + page_size > kv_tensor.block_stride:
-            raise ValueError(
-                f"{label} page range [{kv_tensor.offset}, {kv_tensor.offset + page_size}) "
-                f"exceeds packed block stride {kv_tensor.block_stride}"
-            )
-        expected_size = kv_cache_config.num_blocks * kv_tensor.block_stride
-        if kv_tensor.size != expected_size:
-            raise ValueError(f"{label} size {kv_tensor.size} does not match packed layout size {expected_size}")
-
-        backing = (kv_tensor.size, kv_tensor.block_stride)
-        if packed_backing is None:
-            packed_backing = backing
-        elif backing != packed_backing:
-            raise ValueError(
-                f"{label} packed backing {backing} does not match the first packed backing {packed_backing}"
-            )
-
-        page_end = kv_tensor.offset + page_size
-        for other_start, other_end, other_label in packed_ranges:
-            if kv_tensor.offset < other_end and other_start < page_end:
-                raise ValueError(
-                    f"{label} page range [{kv_tensor.offset}, {page_end}) overlaps "
-                    f"{other_label} page range [{other_start}, {other_end}) in the packed backing"
-                )
-        packed_ranges.append((kv_tensor.offset, page_end, label))
+        if kv_tensor.offset < 0 or kv_tensor.layer_stride < 0:
+            raise ValueError(f"{label} offset and layer stride must be nonnegative")
+        if len(layer_names) > 1 and kv_tensor.layer_stride < page_size:
+            raise ValueError(f"{label} layer stride is smaller than page size {page_size}")
+        view_end = (
+            kv_tensor.offset
+            + (len(layer_names) - 1) * kv_tensor.layer_stride
+            + (kv_cache_config.num_blocks - 1) * kv_tensor.block_stride
+            + page_size
+        )
+        if view_end > kv_tensor.size:
+            raise ValueError(f"{label} view end {view_end} exceeds backing size {kv_tensor.size}")
 
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:

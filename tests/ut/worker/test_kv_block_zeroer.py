@@ -16,6 +16,7 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendSFAIndexerCacheSpec,
     register_ascend_kv_cache_specs,
 )
+from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.utils import AscendKVBlockZeroer
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 
@@ -37,7 +38,6 @@ def _init_zeroer(groups, caches, kernel_sizes, excluded=None):
 
 
 def test_mla_backend_accepts_upstream_cache_dtype_keyword():
-    assert AscendMLABackend.get_kv_cache_block_dim(128, 1, 576, cache_dtype_str="auto") == 0
     assert AscendMLABackend.get_kv_cache_shape(2, 128, 1, 576, cache_dtype_str="auto") == (2, 128, 1, 576)
 
 
@@ -134,7 +134,8 @@ def test_strided_views_keep_payload_separate_from_scheduler_stride(ratio):
 
 
 def test_compressed_cache_uses_physical_block_size():
-    spec = AscendMLAAttentionSpec(block_size=128, num_kv_heads=1, head_size=8, dtype=torch.bfloat16, compress_ratio=4)
+    compression = {"compress_ratio": 4} if vllm_version_is("0.28.0") else {"tokens_per_state": 4}
+    spec = AscendMLAAttentionSpec(block_size=128, num_kv_heads=1, head_size=8, dtype=torch.bfloat16, **compression)
     cache = torch.empty(2, 32, 1, 8, dtype=torch.bfloat16)
     zeroer = _init_zeroer([_group(spec, ["attn"])], {"attn": (cache,)}, [[128]])
     assert zeroer._meta[1].tolist() == [32 * 8 // 2]
